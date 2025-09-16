@@ -3,6 +3,7 @@
 set -e
 
 RESOURCE_GROUP="" #FILL
+SUBSCRIPTION_ID="" #FILL
 LOCATION="swedencentral" 
 ACR_NAME="" #FILL
 IMAGE_NAME="insurance-orchestrator:latest"
@@ -32,6 +33,7 @@ az containerapp env create \
 
 # Create Container App with environment variables
 echo "🚀 Creating Container App..."
+
 az containerapp create \
   --name $CONTAINER_APP_NAME \
   --resource-group $RESOURCE_GROUP \
@@ -51,9 +53,7 @@ az containerapp create \
     AZURE_AI_SEARCH_INDEX_NAME="YOUR_SEARCH_INDEX_NAME" \
     SEARCH_SERVICE_NAME="YOUR_SEARCH_SERVICE_NAME" \
     SEARCH_SERVICE_ENDPOINT="YOUR_SEARCH_SERVICE_ENDPOINT" \
-    SEARCH_ADMIN_KEY="YOUR_SEARCH_ADMIN_KEY" \
-    CLAIM_ID="CL001" \
-    POLICY_NUMBER="LIAB-AUTO-001"
+    SEARCH_ADMIN_KEY="YOUR_SEARCH_ADMIN_KEY"
 
 # Enable managed identity
 echo "🔐 Enabling managed identity..."
@@ -75,11 +75,20 @@ echo "🔐 Assigning permissions to managed identity..."
 az role assignment create \
   --assignee $PRINCIPAL_ID \
   --role "Cognitive Services User" \
-  --scope "/subscriptions/af26648a-f8fe-4c1e-ac30-98c4aea17ae2/resourceGroups/rghack"
+  --scope "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP"
+
+az containerapp ingress enable -n $CONTAINER_APP_NAME -g $RESOURCE_GROUP \
+  --type external \
+  --allow-insecure \
+  --target-port 8000 \
+  --transport auto
 
 # Output info
 echo "✅ Container App '$CONTAINER_APP_NAME' created successfully!"
 echo "🔗 Image: $ACR_LOGIN_SERVER/$IMAGE_NAME"
 echo "🔑 Managed Identity: $PRINCIPAL_ID"
-echo "To update with different claim/policy parameters, use:"
-echo "az containerapp update --name $CONTAINER_APP_NAME --resource-group $RESOURCE_GROUP --set-env-vars CLAIM_ID=your-claim-id POLICY_NUMBER=your-policy-number"
+echo "🌐 Access your Container App at: https://$CONTAINER_APP_NAME.azurecontainerapps.io/docs"
+echo ""
+echo "⚠️  SECURITY WARNING: Your app is now PUBLICLY ACCESSIBLE on the internet!"
+echo "🔒  After testing"
+echo "   • Disabling external ingress: az containerapp ingress disable -n $CONTAINER_APP_NAME -g $RESOURCE_GROUP"

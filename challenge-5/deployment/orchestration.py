@@ -3,8 +3,8 @@ import os
 import time
 import asyncio
 import json
-from typing import Dict, Any
-from datetime import timedelta
+from typing import Dict, Any, Optional
+from datetime import timedelta, datetime
 from azure.identity.aio import DefaultAzureCredential
 from semantic_kernel.agents import (
     AzureAIAgent, 
@@ -17,6 +17,13 @@ from semantic_kernel.agents import AzureAIAgent, AzureAIAgentSettings, AzureAIAg
 from azure.identity import AzureCliCredential  # async credential
 from typing import Annotated
 from semantic_kernel.functions import kernel_function
+
+# FastAPI imports
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import uvicorn
+import logging
 
 # Import the Cosmos DB plugin
 from dotenv import load_dotenv
@@ -320,6 +327,236 @@ class CosmosDBPlugin:
         except Exception as e:
             return f"❌ Error searching documents: {str(e)}"
 
+# Configure logging for FastAPI
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Insurance Claim Orchestration API",
+    description="AI-powered insurance claim processing and policy validation API",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify actual origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Pydantic models for request/response
+class ClaimProcessingRequest(BaseModel):
+    """Request model for processing insurance claims"""
+    claim_id: str = Field(..., description="The unique identifier for the claim", example="CL001")
+    policy_number: str = Field(..., description="The policy number associated with the claim", example="LIAB-AUTO-001")
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "claim_id": "CL001",
+                "policy_number": "LIAB-AUTO-001"
+            }
+        }
+
+class ClaimProcessingResponse(BaseModel):
+    """Response model for claim processing results"""
+    status: str = Field(..., description="Processing status", example="completed")
+    claim_id: str = Field(..., description="The processed claim ID")
+    policy_number: str = Field(..., description="The processed policy number")
+    analysis_result: str = Field(..., description="Comprehensive analysis from all agents")
+    processing_time: Optional[float] = Field(None, description="Processing time in seconds")
+    timestamp: datetime = Field(..., description="When the processing was completed")
+
+class HealthCheckResponse(BaseModel):
+    """Health check response model"""
+    status: str = Field(..., example="healthy")
+    timestamp: datetime = Field(..., description="Current timestamp")
+    services: Dict[str, str] = Field(..., description="Status of dependent services")
+
+class ErrorResponse(BaseModel):
+    """Error response model"""
+    error: str = Field(..., description="Error message")
+    detail: Optional[str] = Field(None, description="Detailed error information")
+    timestamp: datetime = Field(..., description="When the error occurred")
+
+# Global variable to track processing tasks
+processing_tasks: Dict[str, Dict[str, Any]] = {}
+
+# FastAPI endpoints
+@app.get("/", response_model=Dict[str, str])
+async def root():
+    """Root endpoint with basic API information"""
+    return {
+        "message": "Insurance Claim Orchestration API",
+        "version": "1.0.0",
+        "documentation": "/docs",
+        "health": "/health"
+    }
+
+@app.get("/health", response_model=HealthCheckResponse)
+async def health_check():
+    """Health check endpoint to verify API and dependencies status"""
+    try:
+        # Test Cosmos DB connection
+        cosmos_plugin = CosmosDBPlugin()
+        cosmos_status = "healthy"
+        try:
+            # Test connection without full setup
+            test_result = cosmos_plugin.test_connection()
+            if "SUCCESS" in test_result:
+                cosmos_status = "healthy"
+            else:
+                cosmos_status = "degraded"
+        except Exception as e:
+            cosmos_status = f"unhealthy: {str(e)[:100]}"
+        
+        # Check environment variables
+        env_status = "healthy"
+        required_env_vars = [
+            "AI_FOUNDRY_PROJECT_ENDPOINT",
+            "AZURE_AI_CONNECTION_ID",
+            "COSMOS_ENDPOINT",
+            "COSMOS_KEY"
+        ]
+        
+        missing_vars = [var for var in required_env_vars if not os.environ.get(var)]
+        if missing_vars:
+            env_status = f"degraded: missing {', '.join(missing_vars)}"
+        
+        overall_status = "healthy"
+        if cosmos_status != "healthy" or env_status != "healthy":
+            overall_status = "degraded"
+        
+        return HealthCheckResponse(
+            status=overall_status,
+            timestamp=datetime.now(),
+            services={
+                "cosmos_db": cosmos_status,
+                "environment": env_status,
+                "api": "healthy"
+            }
+        )
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return HealthCheckResponse(
+            status="unhealthy",
+            timestamp=datetime.now(),
+            services={
+                "api": f"unhealthy: {str(e)[:100]}",
+                "cosmos_db": "unknown",
+                "environment": "unknown"
+            }
+        )
+
+@app.post("/process-claim", response_model=ClaimProcessingResponse)
+async def process_claim(request: ClaimProcessingRequest):
+    """
+    Process an insurance claim using AI agents for risk analysis and policy validation
+    
+    This endpoint orchestrates multiple AI agents to:
+    - Analyze claim risk using the Risk Analyzer Agent
+    - Validate policy coverage using the Policy Checker Agent
+    - Provide comprehensive analysis results
+    """
+    start_time = asyncio.get_event_loop().time()
+    task_id = f"{request.claim_id}_{int(start_time)}"
+    
+    try:
+        logger.info(f"Starting claim processing for claim_id: {request.claim_id}, policy: {request.policy_number}")
+        
+        # Store task status
+        processing_tasks[task_id] = {
+            "status": "processing",
+            "claim_id": request.claim_id,
+            "policy_number": request.policy_number,
+            "start_time": start_time
+        }
+        
+        # Run the orchestration
+        analysis_result = await run_insurance_claim_orchestration(
+            claim_id=request.claim_id,
+            policy_number=request.policy_number
+        )
+        
+        end_time = asyncio.get_event_loop().time()
+        processing_time = end_time - start_time
+        
+        # Update task status
+        processing_tasks[task_id]["status"] = "completed"
+        processing_tasks[task_id]["result"] = analysis_result
+        processing_tasks[task_id]["processing_time"] = processing_time
+        
+        logger.info(f"Claim processing completed for {request.claim_id} in {processing_time:.2f} seconds")
+        
+        return ClaimProcessingResponse(
+            status="completed",
+            claim_id=request.claim_id,
+            policy_number=request.policy_number,
+            analysis_result=analysis_result,
+            processing_time=processing_time,
+            timestamp=datetime.now()
+        )
+        
+    except Exception as e:
+        logger.error(f"Error processing claim {request.claim_id}: {str(e)}")
+        
+        # Update task status
+        if task_id in processing_tasks:
+            processing_tasks[task_id]["status"] = "failed"
+            processing_tasks[task_id]["error"] = str(e)
+        
+        raise HTTPException(
+            status_code=500,
+            detail=ErrorResponse(
+                error="Claim processing failed",
+                detail=str(e),
+                timestamp=datetime.now()
+            ).dict()
+        )
+
+@app.get("/tasks/{task_id}")
+async def get_task_status(task_id: str):
+    """Get the status of a processing task"""
+    if task_id not in processing_tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    return processing_tasks[task_id]
+
+@app.get("/tasks")
+async def list_tasks():
+    """List all processing tasks"""
+    return {
+        "tasks": processing_tasks,
+        "total_tasks": len(processing_tasks)
+    }
+
+@app.delete("/tasks/{task_id}")
+async def delete_task(task_id: str):
+    """Delete a task from memory"""
+    if task_id not in processing_tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    del processing_tasks[task_id]
+    return {"message": f"Task {task_id} deleted successfully"}
+
+# Exception handlers
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {str(exc)}")
+    return HTTPException(
+        status_code=500,
+        detail=ErrorResponse(
+            error="Internal server error",
+            detail=str(exc),
+            timestamp=datetime.now()
+        ).dict()
+    )
+
 async def create_specialized_agents():
     """Create our specialized insurance processing agents using Semantic Kernel."""
     
@@ -550,10 +787,28 @@ Do not provide generic responses - base your analysis on the specific claim data
         print(f"\n🧹 Orchestration cleanup complete.")
 
 if __name__ == "__main__":
-    import os
-    # Get claim ID and policy number from environment variables or use defaults
-    claim_id = os.environ.get("CLAIM_ID", "CL001")  # Use a real claim ID
-    policy_number = os.environ.get("POLICY_NUMBER", "LIAB-AUTO-001")  # Use a real policy number
+    # Check if running as console app or FastAPI server
+    import sys
     
-    print(f"Processing Claim ID: {claim_id}, Policy Number: {policy_number}")
-    asyncio.run(run_insurance_claim_orchestration(claim_id, policy_number))
+    if len(sys.argv) > 1 and sys.argv[1] == "console":
+        # Console mode - legacy functionality
+        claim_id = os.environ.get("CLAIM_ID", "CL001")  # Use a real claim ID
+        policy_number = os.environ.get("POLICY_NUMBER", "LIAB-AUTO-001")  # Use a real policy number
+        
+        print(f"Processing Claim ID: {claim_id}, Policy Number: {policy_number}")
+        asyncio.run(run_insurance_claim_orchestration(claim_id, policy_number))
+    else:
+        # FastAPI mode - default
+        port = int(os.environ.get("PORT", 8000))
+        host = os.environ.get("HOST", "0.0.0.0")
+        
+        logger.info(f"Starting Insurance Claim Orchestration API on {host}:{port}")
+        logger.info(f"API Documentation: http://{host}:{port}/docs")
+        
+        uvicorn.run(
+            "orchestration:app",
+            host=host,
+            port=port,
+            reload=False,  # Set to True for development
+            log_level="info"
+        )
